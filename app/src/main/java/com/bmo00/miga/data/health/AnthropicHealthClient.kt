@@ -1,13 +1,12 @@
 package com.bmo00.miga.data.health
 
 import com.bmo00.miga.data.model.HealthColorLevel
-import com.bmo00.miga.data.vision.GeminiContent
-import com.bmo00.miga.data.vision.GeminiErrorEnvelope
-import com.bmo00.miga.data.vision.GeminiGenerationConfig
-import com.bmo00.miga.data.vision.GeminiPart
-import com.bmo00.miga.data.vision.GeminiRequest
-import com.bmo00.miga.data.vision.GeminiResponse
-import com.bmo00.miga.data.vision.describeGeminiIncompleteResponse
+import com.bmo00.miga.data.vision.AnthropicContentBlock
+import com.bmo00.miga.data.vision.AnthropicErrorEnvelope
+import com.bmo00.miga.data.vision.AnthropicMessage
+import com.bmo00.miga.data.vision.AnthropicRequest
+import com.bmo00.miga.data.vision.AnthropicResponse
+import com.bmo00.miga.data.vision.describeAnthropicIncompleteResponse
 import com.bmo00.miga.data.vision.stripMarkdownFences
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -16,11 +15,13 @@ import kotlinx.serialization.json.Json
 import java.net.HttpURLConnection
 import java.net.URL
 
-private const val GEMINI_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+private const val ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
+private const val ANTHROPIC_VERSION = "2023-06-01"
 private const val TIMEOUT_MILLIS = 30000
+private const val HEALTH_MAX_TOKENS = 1024
 
-/** Implementación de [RecipeHealthClient] contra la API REST de Google Gemini (generateContent). */
-object GeminiHealthClient : RecipeHealthClient {
+/** Implementación de [RecipeHealthClient] contra la API de Mensajes de Anthropic (Claude). */
+object AnthropicHealthClient : RecipeHealthClient {
 
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
 
@@ -29,17 +30,19 @@ object GeminiHealthClient : RecipeHealthClient {
             try {
                 val prompt = buildHealthPrompt(ingredientsText, stepsText)
                 val requestBody = json.encodeToString(
-                    GeminiRequest.serializer(),
-                    GeminiRequest(
-                        contents = listOf(GeminiContent(parts = listOf(GeminiPart(text = prompt)))),
-                        generationConfig = GeminiGenerationConfig()
+                    AnthropicRequest.serializer(),
+                    AnthropicRequest(
+                        model = model,
+                        maxTokens = HEALTH_MAX_TOKENS,
+                        messages = listOf(AnthropicMessage(content = listOf(AnthropicContentBlock(type = "text", text = prompt))))
                     )
                 )
-                val endpoint = "$GEMINI_ENDPOINT_BASE/$model:generateContent"
-                val connection = URL("$endpoint?key=$apiKey").openConnection() as HttpURLConnection
+                val connection = URL(ANTHROPIC_ENDPOINT).openConnection() as HttpURLConnection
                 connection.requestMethod = "POST"
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json")
+                connection.setRequestProperty("x-api-key", apiKey)
+                connection.setRequestProperty("anthropic-version", ANTHROPIC_VERSION)
                 connection.connectTimeout = TIMEOUT_MILLIS
                 connection.readTimeout = TIMEOUT_MILLIS
                 try {
@@ -48,17 +51,14 @@ object GeminiHealthClient : RecipeHealthClient {
                     if (responseCode != HttpURLConnection.HTTP_OK) {
                         val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() }
                         val reason = errorBody?.let {
-                            runCatching { json.decodeFromString(GeminiErrorEnvelope.serializer(), it).error?.message }.getOrNull()
+                            runCatching { json.decodeFromString(AnthropicErrorEnvelope.serializer(), it).error?.message }.getOrNull()
                         }
-                        return@withContext RecipeHealthResult.Error(reason ?: "Gemini respondió con el código $responseCode")
+                        return@withContext RecipeHealthResult.Error(reason ?: "Claude respondió con el código $responseCode")
                     }
                     val body = connection.inputStream.bufferedReader().use { it.readText() }
-                    val response = json.decodeFromString(GeminiResponse.serializer(), body)
-                    val candidate = response.candidates.firstOrNull()
-                    val text = candidate?.content?.parts?.firstOrNull { it.text != null }?.text
-                        ?: return@withContext RecipeHealthResult.Error(
-                            describeGeminiIncompleteResponse(candidate?.finishReason, response.promptFeedback?.blockReason)
-                        )
+                    val response = json.decodeFromString(AnthropicResponse.serializer(), body)
+                    val text = response.content.firstOrNull { it.type == "text" }?.text
+                        ?: return@withContext RecipeHealthResult.Error(describeAnthropicIncompleteResponse(response.stopReason))
                     val resultDto = try {
                         json.decodeFromString(RecipeHealthResultDto.serializer(), stripMarkdownFences(text))
                     } catch (e: Exception) {

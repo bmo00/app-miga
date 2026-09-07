@@ -8,18 +8,14 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Base64
 
-// El modelo ya no es fijo: lo elige el usuario en Ajustes (ver GeminiModels.kt) porque Google
-// renueva este catálogo con el tiempo y un id fijo en el código se queda obsoleto (como le pasó
-// a "gemini-2.0-flash"). Si una llamada empieza a fallar con 404, es que el modelo elegido ya
-// no existe; comprobar el vigente en https://ai.google.dev/gemini-api/docs/models.
-private const val GEMINI_ENDPOINT_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+private const val ANTHROPIC_ENDPOINT = "https://api.anthropic.com/v1/messages"
+private const val ANTHROPIC_VERSION = "2023-06-01"
 private const val TIMEOUT_MILLIS = 30000
+private const val VISION_MAX_TOKENS = 8192
 
-/** Implementación de [RecipeVisionClient] contra la API REST de Google Gemini (generateContent). */
-object GeminiVisionClient : RecipeVisionClient {
+/** Implementación de [RecipeVisionClient] contra la API de Mensajes de Anthropic (Claude). */
+object AnthropicVisionClient : RecipeVisionClient {
 
-    // coerceInputValues: Gemini a veces pone null en campos de texto opcionales (p.ej. "source")
-    // que en el DTO son String no nulo con valor por defecto; sin esto el parseo falla entero.
     private val json = Json { ignoreUnknownKeys = true; coerceInputValues = true }
 
     override suspend fun extractRecipe(images: List<VisionImageInput>, apiKey: String, model: String): RecipeVisionResult =
@@ -27,22 +23,28 @@ object GeminiVisionClient : RecipeVisionClient {
             if (images.isEmpty()) return@withContext RecipeVisionResult.Error("No hay ninguna foto que procesar")
             try {
                 val requestBody = json.encodeToString(
-                    GeminiRequest.serializer(),
-                    GeminiRequest(
-                        contents = listOf(
-                            GeminiContent(
-                                parts = images.map { GeminiPart(inlineData = GeminiInlineData(it.mimeType, Base64.getEncoder().encodeToString(it.bytes))) } +
-                                    GeminiPart(text = RECIPE_EXTRACTION_PROMPT)
+                    AnthropicRequest.serializer(),
+                    AnthropicRequest(
+                        model = model,
+                        maxTokens = VISION_MAX_TOKENS,
+                        messages = listOf(
+                            AnthropicMessage(
+                                content = images.map {
+                                    AnthropicContentBlock(
+                                        type = "image",
+                                        source = AnthropicImageSource(mediaType = it.mimeType, data = Base64.getEncoder().encodeToString(it.bytes))
+                                    )
+                                } + AnthropicContentBlock(type = "text", text = RECIPE_EXTRACTION_PROMPT)
                             )
-                        ),
-                        generationConfig = GeminiGenerationConfig()
+                        )
                     )
                 )
-                val endpoint = "$GEMINI_ENDPOINT_BASE/$model:generateContent"
-                val connection = URL("$endpoint?key=$apiKey").openConnection() as HttpURLConnection
+                val connection = URL(ANTHROPIC_ENDPOINT).openConnection() as HttpURLConnection
                 connection.requestMethod = "POST"
                 connection.doOutput = true
                 connection.setRequestProperty("Content-Type", "application/json")
+                connection.setRequestProperty("x-api-key", apiKey)
+                connection.setRequestProperty("anthropic-version", ANTHROPIC_VERSION)
                 connection.connectTimeout = TIMEOUT_MILLIS
                 connection.readTimeout = TIMEOUT_MILLIS
                 try {
@@ -51,23 +53,17 @@ object GeminiVisionClient : RecipeVisionClient {
                     if (responseCode != HttpURLConnection.HTTP_OK) {
                         val errorBody = connection.errorStream?.bufferedReader()?.use { it.readText() }
                         val reason = errorBody?.let {
-                            runCatching { json.decodeFromString(GeminiErrorEnvelope.serializer(), it).error?.message }.getOrNull()
+                            runCatching { json.decodeFromString(AnthropicErrorEnvelope.serializer(), it).error?.message }.getOrNull()
                         }
-                        return@withContext RecipeVisionResult.Error(reason ?: "Gemini respondió con el código $responseCode")
+                        return@withContext RecipeVisionResult.Error(reason ?: "Claude respondió con el código $responseCode")
                     }
                     val body = connection.inputStream.bufferedReader().use { it.readText() }
-                    val response = json.decodeFromString(GeminiResponse.serializer(), body)
-                    val candidate = response.candidates.firstOrNull()
-                    val text = candidate?.content?.parts?.firstOrNull { it.text != null }?.text
-                        ?: return@withContext RecipeVisionResult.Error(
-                            describeGeminiIncompleteResponse(candidate?.finishReason, response.promptFeedback?.blockReason)
-                        )
+                    val response = json.decodeFromString(AnthropicResponse.serializer(), body)
+                    val text = response.content.firstOrNull { it.type == "text" }?.text
+                        ?: return@withContext RecipeVisionResult.Error(describeAnthropicIncompleteResponse(response.stopReason))
                     val recipe = try {
                         json.decodeFromString(RecipeVisionResultDto.serializer(), stripMarkdownFences(text))
                     } catch (e: Exception) {
-                        // kotlinx.serialization recorta el fragmento de JSON de su propio mensaje a un
-                        // puñado de caracteres (ver JsonExceptionsKt.minify); nos quedamos solo con la
-                        // parte descriptiva y adjuntamos el texto completo de Gemini aparte, sin recortar.
                         val shortReason = e.message?.substringBefore("\nJSON input:") ?: "no se pudo interpretar el JSON"
                         return@withContext RecipeVisionResult.Error("$shortReason\n\nRespuesta completa del modelo:\n$text")
                     }
